@@ -1,0 +1,7 @@
+bin/
+obj/
+publish/
+*.user
+.vs/
+# Holds the local vLLM URL and key. It must never reach the repo.
+.env

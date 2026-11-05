@@ -1,0 +1,68 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Lantern</title>
+  <link rel="icon" href="icon.svg">
+  <link rel="stylesheet" href="app.css">
+  <script type="module" src="app.js"></script>
+</head>
+<body>
+  <aside id="sidebar">
+    <button type="button" id="new-chat" class="wide">+ New chat</button>
+    <nav id="chat-list"></nav>
+  </aside>
+  <div id="scrim"></div>
+
+  <main>
+    <header>
+      <button type="button" id="toggle-sidebar" class="icon" title="Chats">&#9776;</button>
+      <select id="model" title="Model"></select>
+      <span id="server-status"></span>
+      <button type="button" id="open-settings" class="icon" title="Settings">&#9881;</button>
+    </header>
+
+    <section id="messages">
+      <div id="empty">
+        <img src="icon.svg" alt="" width="56" height="56">
+        <p>Ask anything. Drop files or paste images to attach them.</p>
+      </div>
+    </section>
+
+    <form id="composer">
+      <div id="attachments"></div>
+      <textarea id="input" rows="1" placeholder="Message (Enter to send, Shift+Enter for a new line)"></textarea>
+      <div class="composer-row">
+        <label class="icon" title="Attach files">&#128206;<input type="file" id="file-input" multiple hidden></label>
+        <span id="composer-note"></span>
+        <button type="submit" id="send">Send</button>
+      </div>
+    </form>
+  </main>
+
+  <dialog id="settings">
+    <form method="dialog">
+      <h2>Settings</h2>
+      <label>System prompt
+        <textarea id="set-system" rows="5"></textarea>
+      </label>
+      <div class="grid">
+        <label>Temperature
+          <input id="set-temperature" type="number" min="0" max="2" step="0.05" placeholder="model default">
+        </label>
+        <label>Max tokens
+          <input id="set-max-tokens" type="number" min="1" step="1" placeholder="model default">
+        </label>
+      </div>
+      <p class="hint">Empty fields use the defaults of the model server.</p>
+      <div class="actions">
+        <button value="cancel" formnovalidate>Cancel</button>
+        <button value="save" class="primary">Save</button>
+      </div>
+    </form>
+  </dialog>
+
+  <div id="drop-overlay">Drop files to attach</div>
+</body>
+</html>

@@ -1,0 +1,20 @@
+<Project Sdk="Microsoft.NET.Sdk.Web">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AssemblyName>lantern</AssemblyName>
+    <RootNamespace>Lantern</RootNamespace>
+    <PublishAot>true</PublishAot>
+    <!-- The browser formats all text, so the server needs no culture data. -->
+    <InvariantGlobalization>true</InvariantGlobalization>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- The UI is compiled into the binary, so a deploy is one file with nothing next to it. -->
+    <EmbeddedResource Include="web/*" LogicalName="%(Filename)%(Extension)" />
+    <Content Remove="web/**" />
+  </ItemGroup>
+
+</Project>

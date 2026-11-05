@@ -1,6 +1,6 @@
 import { renderMarkdown } from './markdown.js';
 import { listChats, saveChat, deleteChat } from './store.js';
-import { toolDefinitions, toolFileNote, runTool } from './filetools.js';
+import { toolDefinitions, toolFileNote, runTool, MAX_OUTPUT } from './filetools.js';
 
 const $ = id => document.getElementById(id);
 const els = {
@@ -222,6 +222,7 @@ function messageFooter(msg) {
     if (s.tokens != null) parts.push(`${s.tokens} tokens`);
     if (s.tokensPerSecond != null) parts.push(`${s.tokensPerSecond.toFixed(1)} tok/s`);
     if (s.firstTokenSeconds != null) parts.push(`first token ${s.firstTokenSeconds.toFixed(2)} s`);
+    if (s.contextTokens != null && contextLimit) parts.push(`context ${fmt(s.contextTokens)} / ${fmt(contextLimit)}`);
     if (s.model) parts.push(s.model);
     if (msg.stopped) parts.push('stopped');
     const span = document.createElement('span');
@@ -311,16 +312,27 @@ async function generate() {
   setBusy(true);
   renderChatList();
   try {
+    // Each tool round adds results to the context. Without a limit, a long loop fills the context,
+    // and vLLM then cuts the model off in the middle of a tool call. So the loop ends with one
+    // round without tools, in which the model must answer with what it found.
+    let finalNote = null;
     for (let round = 0; ; round++) {
-      const msg = await streamReply(chat);
+      const msg = await streamReply(chat, finalNote);
       if (!msg.tool_calls) break;
       const files = toolFiles(chat);
-      for (const call of msg.tool_calls)
-        chat.messages.push({ role: 'tool', tool_call_id: call.id, content: runTool(files, call) });
-      if (round + 1 >= MAX_TOOL_ROUNDS) {
-        chat.messages.push({ role: 'assistant', content: '', error: `Stopped after ${MAX_TOOL_ROUNDS} tool rounds.` });
-        break;
+      // Results of one round may use at most half of the free room.
+      const room = roomAfter(msg);
+      const perCall = Math.floor(Math.min(MAX_OUTPUT, (room * CHARS_PER_TOKEN_MIN) / 2 / msg.tool_calls.length));
+      let resultChars = 0;
+      for (const call of msg.tool_calls) {
+        const content = runTool(files, call, Math.max(500, perCall));
+        resultChars += content.length;
+        chat.messages.push({ role: 'tool', tool_call_id: call.id, content });
       }
+      if (round + 1 >= MAX_TOOL_ROUNDS)
+        finalNote = `You used all ${MAX_TOOL_ROUNDS} tool rounds. Answer now with the information you have. Do not call tools.`;
+      else if (roomAfter(msg, resultChars) < 0)
+        finalNote = 'The context is almost full. Answer now with the information you have. Do not call tools.';
     }
   } finally {
     running = null;
@@ -336,7 +348,9 @@ async function generate() {
 // Streams one model reply into a new assistant message and returns it.
 // A reply that asks for tools gets msg.tool_calls. A stopped or failed reply never does,
 // because a tool call without its result makes the next request invalid.
-async function streamReply(chat) {
+// With finalNote, the request has no tools, and the note goes in as a last user message.
+// The note is not stored in the chat: it is an instruction for this one request.
+async function streamReply(chat, finalNote = null) {
   const msg = { role: 'assistant', content: '', reasoning: '' };
   const request = {
     model: els.model.value,
@@ -345,7 +359,8 @@ async function streamReply(chat) {
     stream_options: { include_usage: true },
   };
   const files = toolFiles(chat);
-  if (files.size) request.tools = toolDefinitions([...files.keys()]);
+  if (finalNote) request.messages.push({ role: 'user', content: finalNote });
+  else if (files.size) request.tools = toolDefinitions([...files.keys()]);
   if (settings.temperature !== '') request.temperature = Number(settings.temperature);
   if (settings.maxTokens !== '') request.max_tokens = Number(settings.maxTokens);
 
@@ -359,6 +374,7 @@ async function streamReply(chat) {
   let firstToken = null;
   let firstContent = null;
   let usage = null;
+  let finish = null;
   let frame = 0;
   const redraw = () => {
     if (frame || chat !== current) return;
@@ -381,6 +397,7 @@ async function streamReply(chat) {
     for await (const chunk of readEvents(res.body)) {
       if (chunk.error) throw new Error(chunk.error.message ?? JSON.stringify(chunk.error));
       const delta = chunk.choices?.[0]?.delta;
+      finish = chunk.choices?.[0]?.finish_reason ?? finish;
       const thought = delta?.reasoning ?? delta?.reasoning_content;
       if (thought || delta?.content || delta?.tool_calls) firstToken ??= performance.now();
       if (thought) msg.reasoning += thought;
@@ -399,7 +416,15 @@ async function streamReply(chat) {
       if (chunk.usage) usage = chunk.usage;
       redraw();
     }
-    if (calls.length) msg.tool_calls = calls.filter(Boolean);
+    if (finish === 'length') {
+      // The reply was cut. A cut tool call has broken arguments, so it is not run.
+      const used = usage ? usage.prompt_tokens + usage.completion_tokens : 0;
+      msg.error = contextLimit && used >= contextLimit - 64
+        ? `The reply stopped because the context is full (${fmt(used)} of ${fmt(contextLimit)} tokens). Start a new chat.`
+        : 'The reply stopped at the Max tokens limit from Settings.';
+    } else if (calls.length && !finalNote) {
+      msg.tool_calls = calls.filter(Boolean);
+    }
   } catch (e) {
     if (e.name === 'AbortError') msg.stopped = true;
     else msg.error = e.message;
@@ -555,12 +580,22 @@ async function countTokens(text) {
 const textTokens = files => files.filter(f => f.kind === 'text' && f.mode !== 'tools').reduce((n, f) => n + f.tokens, 0);
 const fmt = n => n.toLocaleString();
 
+const outputReserve = () => (settings.maxTokens !== '' ? Number(settings.maxTokens) : OUTPUT_RESERVE);
+
 // Tokens left for new files: the context, minus what the chat already uses, minus room for the reply.
 function contextBudget() {
   if (!contextLimit) return Infinity;
   const used = current?.messages.findLast(m => m.stats?.contextTokens)?.stats.contextTokens ?? 0;
-  const reserve = settings.maxTokens !== '' ? Number(settings.maxTokens) : OUTPUT_RESERVE;
-  return contextLimit - used - reserve;
+  return contextLimit - used - outputReserve();
+}
+
+// The worst case seen: digit-heavy logs. Text estimates use it, so they err on the safe side.
+const CHARS_PER_TOKEN_MIN = 1.3;
+
+// Free tokens after this reply and extraChars of new text, minus the room the next reply needs.
+function roomAfter(msg, extraChars = 0) {
+  if (!contextLimit || msg.stats?.contextTokens == null) return Infinity;
+  return contextLimit - msg.stats.contextTokens - Math.ceil(extraChars / CHARS_PER_TOKEN_MIN) - outputReserve();
 }
 
 function renderAttachments() {

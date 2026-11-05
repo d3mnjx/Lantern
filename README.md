@@ -72,6 +72,10 @@ A file that fits goes into the prompt. A file that does not fit goes to **tool m
 - The browser runs the tools on the file. Only the results go to the model.
   Each tool call shows as one line in the reply. Click it to see the exact result.
 
+Each tool round adds its results to the context. The results get shorter as the context fills,
+and when the room for a reply runs out, the model gets one last round without tools to answer
+with what it found. The footer of each reply shows the context use, for example `context 41,203 / 262,144`.
+
 Tool mode needs vLLM with tool calling on (`--enable-auto-tool-choice --tool-call-parser <parser>`).
 
 The other choice is **Keep newest lines** on the file chip. It cuts the file to the newest lines that fit,

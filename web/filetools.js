@@ -5,7 +5,7 @@
 
 // One result must stay small: digit-heavy logs are about 1.3 characters per token,
 // so 16,000 characters is about 12,000 tokens, and a long tool loop still fits.
-const MAX_OUTPUT = 16000;
+export const MAX_OUTPUT = 16000;
 const MAX_LINE = 500;
 const MAX_LINES = 200;
 
@@ -73,12 +73,16 @@ export function toolFileNote(file) {
 }
 
 // Returns the result text for one tool call. Errors are text too: the model reads them and can try again.
-export function runTool(files, call) {
+// maxOutput shrinks as the context fills, so a tool loop cannot push the chat past its limit.
+export function runTool(files, call, maxOutput = MAX_OUTPUT) {
+  const limit = text => cutOutput(text, maxOutput);
   let args;
   try {
     args = JSON.parse(call.function.arguments || '{}');
   } catch {
-    return 'Error: the arguments are not valid JSON.';
+    // Echo what arrived, so the model can see what is wrong and send the call again.
+    return `Error: the arguments are not valid JSON. You sent: ${call.function.arguments.slice(0, 300)}\n` +
+      'Call the tool again with complete JSON arguments.';
   }
   // A single file is unambiguous, so accept a wrong or missing name for it.
   const file = files.get(args.file) ?? (files.size === 1 ? [...files.values()][0] : null);
@@ -140,8 +144,8 @@ function cut(line) {
   return line.length > MAX_LINE ? line.slice(0, MAX_LINE) + ' [line cut]' : line;
 }
 
-function limit(text) {
-  return text.length > MAX_OUTPUT
-    ? text.slice(0, MAX_OUTPUT) + '\n[Output cut. Ask for fewer lines or a narrower pattern.]'
+function cutOutput(text, max) {
+  return text.length > max
+    ? text.slice(0, max) + '\n[Output cut to fit the context. Ask for fewer lines or a narrower pattern.]'
     : text;
 }

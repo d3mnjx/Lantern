@@ -1,5 +1,6 @@
 import { renderMarkdown } from './markdown.js';
 import { listChats, saveChat, deleteChat } from './store.js';
+import { toolDefinitions, toolFileNote, runTool } from './filetools.js';
 
 const $ = id => document.getElementById(id);
 const els = {
@@ -9,7 +10,12 @@ const els = {
   settings: $('settings'), dropOverlay: $('drop-overlay'),
 };
 
-const MAX_TEXT_FILE = 2 * 1024 * 1024;
+// Big files are allowed because "Keep newest lines" can cut them down to fit the context.
+const MAX_TEXT_FILE = 10 * 1024 * 1024;
+// Above this size the exact count is slow and its reply (one number per token) is large, so estimate.
+const MAX_EXACT_COUNT = 2 * 1024 * 1024;
+// Room kept free for the reply when max tokens is not set. Reasoning models need a lot.
+const OUTPUT_RESERVE = 8192;
 const MAX_IMAGE_FILE = 20 * 1024 * 1024;
 
 let chats = [];
@@ -117,7 +123,8 @@ $('scrim').onclick = () => document.body.classList.remove('sidebar-open');
 // --- Messages ---
 
 function renderMessages() {
-  const nodes = (current?.messages ?? []).map(messageNode);
+  // Tool results show inside the assistant message that asked for them, not as their own messages.
+  const nodes = (current?.messages ?? []).filter(m => m.role !== 'tool').map(messageNode);
   els.empty.hidden = nodes.length > 0;
   els.messages.replaceChildren(els.empty, ...nodes);
   els.messages.scrollTop = els.messages.scrollHeight;
@@ -137,6 +144,8 @@ function fillMessage(node) {
   // Keep the thinking panel open across redraws if the user opened it during the stream.
   const thinkingOpen = node.querySelector('details.reasoning')?.open ?? false;
   node.replaceChildren();
+  // A tool round is one step of a longer reply, so it sits close to the next step.
+  node.classList.toggle('tool-round', Boolean(msg.tool_calls ?? msg.pendingCalls));
 
   if (msg.role === 'user') {
     if (msg.files?.length) node.append(fileChips(msg.files));
@@ -174,13 +183,34 @@ function fillMessage(node) {
     dots.textContent = '…';
     node.append(dots);
   }
+  for (const call of msg.tool_calls ?? msg.pendingCalls ?? []) if (call) node.append(toolCallNode(call));
   if (msg.error) {
     const err = document.createElement('div');
     err.className = 'error';
     err.textContent = msg.error;
     node.append(err);
   }
-  if (msg !== running?.message) node.append(messageFooter(msg));
+  if (msg !== running?.message && !msg.tool_calls) node.append(messageFooter(msg));
+}
+
+// One line per tool call. It opens to show the exact result the model got.
+function toolCallNode(call) {
+  const details = document.createElement('details');
+  details.className = 'tool-call';
+  const summary = document.createElement('summary');
+  let args = call.function.arguments;
+  try {
+    args = Object.entries(JSON.parse(args)).filter(([k]) => k !== 'file').map(([k, v]) => `${k}=${JSON.stringify(v)}`).join(', ');
+  } catch { /* still streaming: show the raw text */ }
+  const result = current?.messages.find(m => m.role === 'tool' && m.tool_call_id === call.id)?.content;
+  summary.textContent = `${call.function.name}(${args})` + (result ? ` \u2192 ${result.split('\n')[0]}` : ' \u2026');
+  details.append(summary);
+  if (result) {
+    const pre = document.createElement('pre');
+    pre.textContent = result;
+    details.append(pre);
+  }
+  return details;
 }
 
 function messageFooter(msg) {
@@ -208,7 +238,8 @@ function messageFooter(msg) {
     again.type = 'button';
     again.textContent = 'Regenerate';
     again.onclick = () => {
-      current.messages.pop();
+      // A reply can be several messages (tool calls and results). Remove all of them.
+      while (current.messages.at(-1)?.role !== 'user') current.messages.pop();
       generate();
     };
     foot.append(again);
@@ -250,7 +281,8 @@ els.composer.onsubmit = e => {
   // A failed reply with no text adds nothing to the context, so drop it before the next turn.
   const last = current.messages.at(-1);
   if (last?.role === 'assistant' && last.error && !last.content) current.messages.pop();
-  current.messages.push({ role: 'user', content: text, files: pendingFiles });
+  // The untrimmed copy is only for "Keep newest lines". Do not store it in the history.
+  current.messages.push({ role: 'user', content: text, files: pendingFiles.map(({ original, ...f }) => f) });
   pendingFiles = [];
   els.input.value = '';
   autosize();
@@ -270,8 +302,41 @@ function autosize() {
   els.input.style.height = Math.min(els.input.scrollHeight, 240) + 'px';
 }
 
+// The model may call file tools several times before it answers. Each round is one request.
+const MAX_TOOL_ROUNDS = 20;
+
 async function generate() {
   const chat = current;
+  running = { controller: new AbortController(), message: null };
+  setBusy(true);
+  renderChatList();
+  try {
+    for (let round = 0; ; round++) {
+      const msg = await streamReply(chat);
+      if (!msg.tool_calls) break;
+      const files = toolFiles(chat);
+      for (const call of msg.tool_calls)
+        chat.messages.push({ role: 'tool', tool_call_id: call.id, content: runTool(files, call) });
+      if (round + 1 >= MAX_TOOL_ROUNDS) {
+        chat.messages.push({ role: 'assistant', content: '', error: `Stopped after ${MAX_TOOL_ROUNDS} tool rounds.` });
+        break;
+      }
+    }
+  } finally {
+    running = null;
+    setBusy(false);
+    chat.updated = Date.now();
+    await saveChat(chat).catch(e => (els.note.textContent = `Cannot save chat: ${e.message}`));
+    chats.sort((a, b) => b.updated - a.updated);
+    renderChatList();
+    if (chat === current) renderMessages();
+  }
+}
+
+// Streams one model reply into a new assistant message and returns it.
+// A reply that asks for tools gets msg.tool_calls. A stopped or failed reply never does,
+// because a tool call without its result makes the next request invalid.
+async function streamReply(chat) {
   const msg = { role: 'assistant', content: '', reasoning: '' };
   const request = {
     model: els.model.value,
@@ -279,17 +344,18 @@ async function generate() {
     stream: true,
     stream_options: { include_usage: true },
   };
+  const files = toolFiles(chat);
+  if (files.size) request.tools = toolDefinitions([...files.keys()]);
   if (settings.temperature !== '') request.temperature = Number(settings.temperature);
   if (settings.maxTokens !== '') request.max_tokens = Number(settings.maxTokens);
 
   chat.messages.push(msg);
-  running = { controller: new AbortController(), message: msg };
-  setBusy(true);
-  renderChatList();
-  renderMessages();
+  running.message = msg;
+  if (chat === current) renderMessages();
   const node = els.messages.lastElementChild;
 
   const started = performance.now();
+  const calls = [];
   let firstToken = null;
   let firstContent = null;
   let usage = null;
@@ -316,37 +382,50 @@ async function generate() {
       if (chunk.error) throw new Error(chunk.error.message ?? JSON.stringify(chunk.error));
       const delta = chunk.choices?.[0]?.delta;
       const thought = delta?.reasoning ?? delta?.reasoning_content;
-      if (thought || delta?.content) firstToken ??= performance.now();
+      if (thought || delta?.content || delta?.tool_calls) firstToken ??= performance.now();
       if (thought) msg.reasoning += thought;
       if (delta?.content) {
         if (msg.content === '' && delta.content.trim()) firstContent ??= performance.now();
         msg.content += delta.content;
       }
+      // Tool calls arrive in pieces: the first piece has the id and name, later pieces add argument text.
+      for (const part of delta?.tool_calls ?? []) {
+        const call = (calls[part.index ?? 0] ??= { id: '', type: 'function', function: { name: '', arguments: '' } });
+        if (part.id) call.id = part.id;
+        if (part.function?.name) call.function.name += part.function.name;
+        if (part.function?.arguments) call.function.arguments += part.function.arguments;
+        msg.pendingCalls = calls;
+      }
       if (chunk.usage) usage = chunk.usage;
       redraw();
     }
+    if (calls.length) msg.tool_calls = calls.filter(Boolean);
   } catch (e) {
     if (e.name === 'AbortError') msg.stopped = true;
     else msg.error = e.message;
   } finally {
+    delete msg.pendingCalls;
     const ended = performance.now();
     if (frame) cancelAnimationFrame(frame);
     if (msg.reasoning && firstToken && firstContent) msg.thoughtSeconds = Math.round((firstContent - firstToken) / 1000);
     msg.stats = {
       model: request.model,
       tokens: usage?.completion_tokens,
+      contextTokens: usage ? usage.prompt_tokens + usage.completion_tokens : undefined,
       firstTokenSeconds: firstToken ? (firstToken - started) / 1000 : undefined,
       tokensPerSecond: usage && firstToken && ended > firstToken
         ? usage.completion_tokens / ((ended - firstToken) / 1000) : undefined,
     };
-    running = null;
-    setBusy(false);
-    chat.updated = Date.now();
-    await saveChat(chat).catch(e => (els.note.textContent = `Cannot save chat: ${e.message}`));
-    chats.sort((a, b) => b.updated - a.updated);
-    renderChatList();
-    if (chat === current) renderMessages();
   }
+  return msg;
+}
+
+// Files in this chat that the model reads with tools instead of in the prompt. Later files win a name clash.
+function toolFiles(chat) {
+  const files = new Map();
+  for (const m of chat.messages)
+    for (const f of m.files ?? []) if (f.mode === 'tools') files.set(f.name, f);
+  return files;
 }
 
 function apiMessages(chat) {
@@ -356,11 +435,17 @@ function apiMessages(chat) {
     if (m.role === 'assistant') {
       // Earlier thinking is not sent back. Chat templates drop it, and it costs context.
       const { content } = splitThinking(m);
-      if (content) out.push({ role: 'assistant', content });
+      if (m.tool_calls) out.push({ role: 'assistant', content, tool_calls: m.tool_calls });
+      else if (content) out.push({ role: 'assistant', content });
+      continue;
+    }
+    if (m.role === 'tool') {
+      out.push({ role: 'tool', tool_call_id: m.tool_call_id, content: m.content });
       continue;
     }
     const files = m.files ?? [];
-    const text = [...files.filter(f => f.kind === 'text').map(fileBlock), m.content].filter(Boolean).join('\n\n');
+    const textFiles = files.filter(f => f.kind === 'text').map(f => (f.mode === 'tools' ? toolFileNote(f) : fileBlock(f)));
+    const text = [...textFiles, m.content].filter(Boolean).join('\n\n');
     const images = files.filter(f => f.kind === 'image');
     out.push({
       role: 'user',
@@ -376,7 +461,8 @@ function apiMessages(chat) {
 function fileBlock(file) {
   const longest = Math.max(0, ...(file.data.match(/`+/g) ?? []).map(r => r.length));
   const fence = '`'.repeat(Math.max(3, longest + 1));
-  return `File: ${file.name}\n${fence}\n${file.data}\n${fence}`;
+  const partial = file.partial ? ` (only the newest ${file.partial.kept} of ${file.partial.total} lines)` : '';
+  return `File: ${file.name}${partial}\n${fence}\n${file.data}\n${fence}`;
 }
 
 async function* readEvents(stream) {
@@ -423,11 +509,14 @@ async function addFiles(list) {
         if (file.size > MAX_IMAGE_FILE) throw new Error('image is larger than 20 MB');
         pendingFiles.push({ name: file.name || 'pasted image', kind: 'image', data: await readDataUrl(file) });
       } else {
-        if (file.size > MAX_TEXT_FILE) throw new Error('file is larger than 2 MB');
+        if (file.size > MAX_TEXT_FILE) throw new Error('file is larger than 10 MB');
         const text = await file.text();
         // A NUL character means binary content. Models cannot use it, and it wastes context.
         if (text.includes('\u0000')) throw new Error('not a text file');
-        pendingFiles.push({ name: file.name, kind: 'text', data: text });
+        const entry = { name: file.name, kind: 'text', data: text, ...(await countTokens(text)) };
+        // A file that does not fit goes to tool mode: the model reads parts of it on request.
+        if (entry.tokens > contextBudget() - textTokens(pendingFiles)) entry.mode = 'tools';
+        pendingFiles.push(entry);
       }
     } catch (e) {
       els.note.textContent = `${file.name}: ${e.message}`;
@@ -445,14 +534,74 @@ function readDataUrl(file) {
   });
 }
 
-// About four characters per token. This is only a guide, so the user sees which file is too big.
-const estimateTokens = text => Math.ceil(text.length / 4);
+// Exact count from the vLLM tokenizer. A guess from the length is unsafe: prose is about
+// 4 characters per token, but logs and CSV full of digits measure about 1.3.
+async function countTokens(text) {
+  if (text.length <= MAX_EXACT_COUNT) {
+    try {
+      const res = await fetch('api/tokenize', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ model: els.model.value, prompt: text, add_special_tokens: false }),
+      });
+      if (res.ok) return { tokens: (await res.json()).count, exact: true };
+    } catch { /* fall back to the estimate */ }
+  }
+  // Two characters per token overestimates most text. A false warning is better than a rejected prompt.
+  return { tokens: Math.ceil(text.length / 2), exact: false };
+}
+
+// Only files that go into the prompt count. Files in tool mode cost nothing until the model reads them.
+const textTokens = files => files.filter(f => f.kind === 'text' && f.mode !== 'tools').reduce((n, f) => n + f.tokens, 0);
+const fmt = n => n.toLocaleString();
+
+// Tokens left for new files: the context, minus what the chat already uses, minus room for the reply.
+function contextBudget() {
+  if (!contextLimit) return Infinity;
+  const used = current?.messages.findLast(m => m.stats?.contextTokens)?.stats.contextTokens ?? 0;
+  const reserve = settings.maxTokens !== '' ? Number(settings.maxTokens) : OUTPUT_RESERVE;
+  return contextLimit - used - reserve;
+}
 
 function renderAttachments() {
   els.attachments.replaceChildren(fileChips(pendingFiles, true));
-  const tokens = pendingFiles.filter(f => f.kind === 'text').reduce((n, f) => n + estimateTokens(f.data), 0);
-  if (contextLimit && tokens > contextLimit * 0.8)
-    els.note.textContent = `Files are about ${tokens.toLocaleString()} tokens. The model context is ${contextLimit.toLocaleString()}.`;
+  const need = textTokens(pendingFiles);
+  const budget = contextBudget();
+  if (need > budget)
+    els.note.textContent = `Files need ${fmt(need)} tokens, but only ${fmt(Math.max(0, budget))} fit.`;
+}
+
+// Cuts the file to the newest lines that fit. Logs append at the end, so the tail matters most.
+// A CSV or TSV keeps its first line, so the columns still have names.
+async function keepNewest(file, button) {
+  const allowed = contextBudget() - textTokens(pendingFiles.filter(f => f !== file));
+  if (allowed < 1000) {
+    els.note.textContent = 'The context has no room left. Start a new chat.';
+    return;
+  }
+  button.disabled = true;
+  button.textContent = 'Trimming\u2026';
+  const source = file.original ?? file.data;
+  const lines = source.replace(/\n$/, '').split('\n');
+  const header = /\.(csv|tsv)$/i.test(file.name) ? lines.shift() : null;
+  // Start from the measured characters per token, then correct with each real count.
+  let target = allowed * (file.data.length / file.tokens) * 0.95;
+  for (let attempt = 0; attempt < 6; attempt++) {
+    let size = header === null ? 0 : header.length + 1;
+    let start = lines.length;
+    while (start > 0 && size + lines[start - 1].length + 1 <= target) size += lines[--start].length + 1;
+    const kept = lines.slice(start);
+    const text = (header === null ? kept : [header, ...kept]).join('\n');
+    const count = await countTokens(text);
+    if (count.tokens <= allowed || kept.length === 0 || attempt === 5) {
+      Object.assign(file, { data: text, original: source, ...count, partial: { kept: kept.length, total: lines.length } });
+      delete file.mode;
+      break;
+    }
+    target *= (allowed / count.tokens) * 0.97;
+  }
+  els.note.textContent = '';
+  renderAttachments();
 }
 
 function fileChips(files, removable = false) {
@@ -468,9 +617,24 @@ function fileChips(files, removable = false) {
       chip.append(img);
     }
     const label = document.createElement('span');
-    label.textContent = file.kind === 'text'
-      ? `${file.name} (~${estimateTokens(file.data).toLocaleString()} tok)` : file.name;
+    if (file.kind === 'text') {
+      const tokens = file.tokens == null ? '' : ` (${file.exact ? '' : '~'}${fmt(file.tokens)} tok)`;
+      const partial = file.partial ? `, newest ${fmt(file.partial.kept)} of ${fmt(file.partial.total)} lines` : '';
+      const mode = file.mode === 'tools' ? ', read with tools' : '';
+      label.textContent = file.name + tokens + partial + mode;
+      if (mode) label.title = 'Too large for the context. The model searches and reads parts of it with tools.';
+    } else {
+      label.textContent = file.name;
+    }
     chip.append(label);
+    if (removable && file.kind === 'text' && (file.mode === 'tools' || textTokens(files) > contextBudget())) {
+      const trim = document.createElement('button');
+      trim.type = 'button';
+      trim.className = 'trim';
+      trim.textContent = 'Keep newest lines';
+      trim.onclick = () => keepNewest(file, trim);
+      chip.append(trim);
+    }
     if (removable) {
       const x = document.createElement('button');
       x.type = 'button';

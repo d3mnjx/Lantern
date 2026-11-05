@@ -10,6 +10,8 @@ if (string.IsNullOrWhiteSpace(vllmUrl))
     return 1;
 }
 var apiKey = builder.Configuration["VLLM_API_KEY"];
+// vLLM serves /tokenize at the server root, not under /v1.
+var vllmRoot = vllmUrl.EndsWith("/v1") ? vllmUrl[..^3] : vllmUrl;
 // One log line per request is noise for a single-user tool. Startup and errors still show.
 builder.Logging.AddFilter("Microsoft.AspNetCore", LogLevel.Warning);
 
@@ -33,8 +35,9 @@ var assets = typeof(Program).Assembly.GetManifestResourceNames().ToHashSet();
 app.MapGet("/", ctx => ServeAsset(ctx, "index.html"));
 app.MapGet("/{file}", ctx => ServeAsset(ctx, (string)ctx.Request.RouteValues["file"]!));
 
-app.MapGet("/api/models", ctx => Forward(ctx, HttpMethod.Get, "models"));
-app.MapPost("/api/chat", ctx => Forward(ctx, HttpMethod.Post, "chat/completions"));
+app.MapGet("/api/models", ctx => Forward(ctx, HttpMethod.Get, $"{vllmUrl}/models"));
+app.MapPost("/api/chat", ctx => Forward(ctx, HttpMethod.Post, $"{vllmUrl}/chat/completions"));
+app.MapPost("/api/tokenize", ctx => Forward(ctx, HttpMethod.Post, $"{vllmRoot}/tokenize"));
 
 Console.WriteLine($"Lantern forwards to {vllmUrl}");
 app.Run();
@@ -63,9 +66,9 @@ async Task ServeAsset(HttpContext ctx, string name)
 
 // The body passes through as raw bytes in both directions. The server never parses the JSON,
 // so it stays independent of vLLM schema changes and needs no serializer metadata for AOT.
-async Task Forward(HttpContext ctx, HttpMethod method, string path)
+async Task Forward(HttpContext ctx, HttpMethod method, string url)
 {
-    using var request = new HttpRequestMessage(method, $"{vllmUrl}/{path}");
+    using var request = new HttpRequestMessage(method, url);
     if (method == HttpMethod.Post)
     {
         request.Content = new StreamContent(ctx.Request.Body);

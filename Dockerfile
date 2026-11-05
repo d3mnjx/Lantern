@@ -20,6 +20,7 @@ RUN dotnet publish -c Release -a $TARGETARCH --no-restore -o /out
 FROM mcr.microsoft.com/dotnet/runtime-deps:10.0.14-noble-chiseled
 WORKDIR /app
 COPY --from=build /out/lantern .
-ENV ASPNETCORE_HTTP_PORTS=8080
-EXPOSE 8080
+# The base image sets ASPNETCORE_HTTP_PORTS=8080. Override it to keep the Lantern port.
+ENV ASPNETCORE_HTTP_PORTS=7319
+EXPOSE 7319
 ENTRYPOINT ["./lantern"]

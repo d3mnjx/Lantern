@@ -38,12 +38,12 @@ jobs:
           cache-to: type=gha,mode=max
       - name: Smoke test
         run: |
-          docker run -d --name lantern -p 8080:8080 -e VLLM_URL=http://127.0.0.1:9/v1 lantern:test
-          for i in $(seq 1 20); do curl -fsS http://localhost:8080/ >/dev/null && break; sleep 0.5; done
-          curl -fsS http://localhost:8080/ | grep -q '<title>Lantern</title>'
-          curl -fsS http://localhost:8080/app.js >/dev/null
+          docker run -d --name lantern -p 7319:7319 -e VLLM_URL=http://127.0.0.1:9/v1 lantern:test
+          for i in $(seq 1 20); do curl -fsS http://localhost:7319/ >/dev/null && break; sleep 0.5; done
+          curl -fsS http://localhost:7319/ | grep -q '<title>Lantern</title>'
+          curl -fsS http://localhost:7319/app.js >/dev/null
           # The model server is unreachable on purpose, so the proxy must answer 502.
-          test "$(curl -s -o /dev/null -w '%{http_code}' http://localhost:8080/api/models)" = 502
+          test "$(curl -s -o /dev/null -w '%{http_code}' http://localhost:7319/api/models)" = 502
           docker logs lantern
 
       - name: Log in to GitHub Container Registry

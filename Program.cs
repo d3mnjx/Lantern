@@ -13,6 +13,11 @@ var apiKey = builder.Configuration["VLLM_API_KEY"];
 // One log line per request is noise for a single-user tool. Startup and errors still show.
 builder.Logging.AddFilter("Microsoft.AspNetCore", LogLevel.Warning);
 
+// With no port setting, listen on the LAN at 7319. The ASP.NET default (localhost:5000) is not
+// reachable from other machines, and 5000 and 8080 clash with many other tools.
+if (string.IsNullOrEmpty(builder.Configuration["urls"]) && string.IsNullOrEmpty(builder.Configuration["http_ports"]))
+    builder.WebHost.UseUrls("http://0.0.0.0:7319");
+
 // Images travel as base64 inside the chat JSON, so the 30 MB Kestrel default is too small.
 builder.WebHost.ConfigureKestrel(o => o.Limits.MaxRequestBodySize = 100 * 1024 * 1024);
 

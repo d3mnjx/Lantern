@@ -16,13 +16,13 @@ It is for one user on a LAN. It has no login.
 ## Run with Docker
 
 ```bash
-docker run -d --name lantern -p 8080:8080 \
+docker run -d --name lantern -p 7319:7319 \
   -e VLLM_URL=http://<vllm-host>:8000/v1 \
   --restart unless-stopped \
   ghcr.io/d3mnjx/lantern:latest
 ```
 
-Then open `http://<docker-host>:8080`. Images exist for `linux/amd64` and `linux/arm64`.
+Then open `http://<docker-host>:7319`. Images exist for `linux/amd64` and `linux/arm64`.
 
 With Docker Compose, copy `.env.example` to `.env`, set `VLLM_URL`, and run `docker compose up -d`.
 
@@ -32,7 +32,7 @@ With Docker Compose, copy `.env.example` to `.env`, set `VLLM_URL`, and run `doc
 |---|---|---|
 | `VLLM_URL` | yes | Base URL of the OpenAI-compatible API, including `/v1`. |
 | `VLLM_API_KEY` | no | Sent as a Bearer token, for a vLLM started with `--api-key`. |
-| `ASPNETCORE_HTTP_PORTS` | no | Listen port. The image uses `8080`. |
+| `ASPNETCORE_HTTP_PORTS` | no | Listen port. The default is `7319`. |
 
 ## Build from source
 
@@ -40,10 +40,10 @@ Needs the .NET 10 SDK and the [Native AOT prerequisites](https://learn.microsoft
 
 ```bash
 dotnet publish -c Release -o publish
-VLLM_URL=http://<vllm-host>:8000/v1 ASPNETCORE_URLS=http://0.0.0.0:8080 ./publish/lantern
+VLLM_URL=http://<vllm-host>:8000/v1 ./publish/lantern
 ```
 
-The output is one self-contained file, `publish/lantern`, of about 12 MB.
+It listens on `0.0.0.0:7319`. The output is one self-contained file, `publish/lantern`, of about 12 MB.
 
 ## How it works
 

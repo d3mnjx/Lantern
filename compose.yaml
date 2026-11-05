@@ -3,7 +3,7 @@ services:
     image: ghcr.io/d3mnjx/lantern:latest
     build: .
     ports:
-      - "${LANTERN_PORT:-8080}:8080"
+      - "${LANTERN_PORT:-7319}:7319"
     environment:
       VLLM_URL: ${VLLM_URL:?Set VLLM_URL in .env}
       VLLM_API_KEY: ${VLLM_API_KEY:-}
